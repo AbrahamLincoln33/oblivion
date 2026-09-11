@@ -1,0 +1,249 @@
+name: Build Oblivion v8 Windows Installer
+#
+# Drop this file into a fork of bepass-org/oblivion at .github/workflows/
+# then run it from the Actions tab. It reproduces the official v8 Windows
+# job exactly, and adds an Inno Setup installer on top.
+#
+name: Build Oblivion v8 Windows Installer
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  FLUTTER_VERSION: "3.44.3"
+  GO_VERSION: "1.26"
+  PSIPHON_REF: shirokhorshid
+
+jobs:
+  windows:
+    name: Windows x64 installer
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout v8 with the Aether core and hev-socks5-tunnel
+        uses: actions/checkout@v4
+        with:
+          repository: bepass-org/oblivion
+          ref: v8
+          submodules: recursive
+
+      - name: Checkout Psiphon core (fork with udpgw support)
+        uses: actions/checkout@v4
+        with:
+          repository: CluvexStudio/psiphon-tunnel-core
+          ref: ${{ env.PSIPHON_REF }}
+          path: psiphon-temp
+
+      - name: Move Psiphon to the location CMake expects
+        run: mv psiphon-temp ../psiphon-tunnel-core
+
+      - name: Set up Go for the Psiphon build
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: false
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          cache: true
+
+      - name: Report the toolchain
+        run: flutter --version
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install NASM, needed to build BoringSSL
+        shell: pwsh
+        run: |
+          choco install nasm --no-progress -y
+          $nasm = Join-Path $env:ProgramFiles 'NASM'
+          if (-not (Test-Path (Join-Path $nasm 'nasm.exe'))) {
+            Write-Error "nasm.exe was not installed under $nasm"
+            exit 1
+          }
+          $nasm | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          & (Join-Path $nasm 'nasm.exe') -v
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            aetherproject/aether/target
+          key: cargo-windows-x64-${{ hashFiles('aetherproject/aether/Cargo.lock') }}
+          restore-keys: cargo-windows-x64-
+
+      - name: Set up MSYS2 to build the tunnel helper
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MSYS
+          update: true
+          install: gcc make
+
+      - name: Build the tunnel helper (hev-socks5-tunnel + wintun)
+        shell: msys2 {0}
+        run: |
+          set -e
+          root=$(cygpath "$GITHUB_WORKSPACE")
+          dest="$root/windows/hevtun"
+          mkdir -p "$dest"
+          cd "$root/android/aether-vpn/src/main/jni/hev-socks5-tunnel"
+          make -j"$(nproc)" CFLAGS=-Wno-error
+          cp bin/hev-socks5-tunnel.exe "$dest/"
+          cp third-part/wintun/bin/wintun.dll "$dest/"
+          ldd bin/hev-socks5-tunnel.exe | awk '/msys/ {print $3}' | while read -r dll; do
+            cp "$dll" "$dest/"
+          done
+          ls -la "$dest"
+
+      - name: Build
+        run: |
+          flutter pub get
+          flutter build windows --release
+
+      - name: Check that the tunnel helper shipped
+        shell: pwsh
+        run: |
+          $runner = "build/windows/x64/runner/Release"
+          foreach ($artefact in @("hev-socks5-tunnel.exe", "wintun.dll")) {
+            if (-not (Test-Path "$runner/$artefact")) {
+              Write-Output "::error::$artefact is missing, the release would be proxy only"
+              exit 1
+            }
+          }
+          if (-not (Get-ChildItem "$runner/msys-*.dll" -ErrorAction SilentlyContinue)) {
+            Write-Output "::error::the msys runtime the helper needs is missing"
+            exit 1
+          }
+          Write-Output "the tunnel helper shipped, tunnel mode is available"
+
+      - name: Check the cores and the privileged helper shipped
+        shell: pwsh
+        run: |
+          $runner = "build/windows/x64/runner/Release"
+          foreach ($artefact in @("oblivion.exe", "oblivion_core.dll",
+                                  "oblivion-helper.exe", "aether.exe",
+                                  "psiphon.exe", "flutter_windows.dll")) {
+            if (-not (Test-Path "$runner/$artefact")) {
+              Write-Output "::error::$artefact is missing from the build"
+              exit 1
+            }
+          }
+          Get-ChildItem $runner | Select-Object Name, Length
+
+      - name: Write the Inno Setup script
+        shell: pwsh
+        run: |
+          @'
+          #define AppName    "Oblivion"
+          #define AppVersion "8.0.0"
+          #define AppPublish "bepass-org"
+          #define AppExe     "oblivion.exe"
+
+          [Setup]
+          AppId={{7E3F1C2A-9B44-4E8D-A6F1-0B9C5D2E7A31}
+          AppName={#AppName}
+          AppVersion={#AppVersion}
+          AppVerName={#AppName} {#AppVersion}
+          AppPublisher={#AppPublish}
+          AppSupportURL=https://github.com/bepass-org/oblivion
+          DefaultDirName={autopf}\{#AppName}
+          DefaultGroupName={#AppName}
+          UninstallDisplayIcon={app}\{#AppExe}
+          UninstallDisplayName={#AppName} {#AppVersion}
+          OutputDir=..\dist
+          OutputBaseFilename=oblivion-v8-windows-x64-setup
+          Compression=lzma2/max
+          SolidCompression=yes
+          WizardStyle=modern
+          ArchitecturesInstallIn64BitMode=x64compatible
+          ArchitecturesAllowed=x64compatible
+          ; Tunnel mode installs a wintun adapter and changes system routes,
+          ; so the app needs administrator rights.
+          PrivilegesRequired=admin
+          MinVersion=10.0
+
+          [Languages]
+          Name: "english"; MessagesFile: "compiler:Default.isl"
+
+          [Tasks]
+          Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; \
+            GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
+          Name: "startupicon"; Description: "Start Oblivion when Windows starts"; \
+            GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
+
+          [Files]
+          ; the whole Flutter release bundle: exe, cores, helper,
+          ; hev-socks5-tunnel, wintun.dll, msys runtime, data\ and assets
+          Source: "*"; DestDir: "{app}"; Excludes: "oblivion.iss"; Flags: recursesubdirs createallsubdirs ignoreversion
+
+          [Icons]
+          Name: "{group}\{#AppName}";              Filename: "{app}\{#AppExe}"
+          Name: "{group}\{cm:UninstallProgram,{#AppName}}"; Filename: "{uninstallexe}"
+          Name: "{autodesktop}\{#AppName}";        Filename: "{app}\{#AppExe}"; Tasks: desktopicon
+          Name: "{userstartup}\{#AppName}";        Filename: "{app}\{#AppExe}"; Tasks: startupicon
+
+          [Run]
+          Filename: "{app}\{#AppExe}"; Description: "{cm:LaunchProgram,{#AppName}}"; \
+            Flags: nowait postinstall skipifsilent runascurrentuser
+
+          [UninstallRun]
+          ; make sure nothing is holding the tun adapter open
+          Filename: "{sys}\taskkill.exe"; Parameters: "/f /im oblivion.exe";           Flags: runhidden; RunOnceId: "killapp"
+          Filename: "{sys}\taskkill.exe"; Parameters: "/f /im oblivion-helper.exe";    Flags: runhidden; RunOnceId: "killhelper"
+          Filename: "{sys}\taskkill.exe"; Parameters: "/f /im aether.exe";             Flags: runhidden; RunOnceId: "killaether"
+          Filename: "{sys}\taskkill.exe"; Parameters: "/f /im psiphon.exe";            Flags: runhidden; RunOnceId: "killpsiphon"
+          Filename: "{sys}\taskkill.exe"; Parameters: "/f /im hev-socks5-tunnel.exe";  Flags: runhidden; RunOnceId: "killtun"
+          '@ | Set-Content -Path "build/windows/x64/runner/Release/oblivion.iss" -Encoding UTF8
+
+      - name: Compile the installer
+        shell: pwsh
+        run: |
+          # Inno Setup ships on windows-latest; install it if the image changes
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) {
+            choco install innosetup --no-progress -y
+          }
+          if (-not (Test-Path $iscc)) {
+            $iscc = "${env:ProgramFiles}\Inno Setup 6\ISCC.exe"
+          }
+          & $iscc "build/windows/x64/runner/Release/oblivion.iss"
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
+      - name: Show the result
+        shell: pwsh
+        run: |
+          Get-ChildItem build/windows/x64/runner/dist
+          $exe = Get-ChildItem build/windows/x64/runner/dist/*.exe | Select-Object -First 1
+          Write-Output "installer: $($exe.Name)  $([math]::Round($exe.Length/1MB,1)) MB"
+          Write-Output "sha256: $((Get-FileHash $exe.FullName -Algorithm SHA256).Hash)"
+
+      - name: Upload the installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: oblivion-v8-windows-x64-setup
+          path: build/windows/x64/runner/dist/*.exe
+          if-no-files-found: error
+
+      - name: Also upload the portable zip
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path staging/oblivion | Out-Null
+          Copy-Item -Recurse -Force `
+            -Path "build/windows/x64/runner/Release/*" -Destination staging/oblivion
+          Remove-Item staging/oblivion/oblivion.iss -ErrorAction SilentlyContinue
+          Compress-Archive -Path staging/oblivion `
+                           -DestinationPath "oblivion-v8-windows-x64-portable.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: oblivion-v8-windows-x64-portable
+          path: oblivion-v8-windows-x64-portable.zip
+          if-no-files-found: error
