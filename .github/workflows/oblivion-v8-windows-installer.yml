@@ -4,7 +4,7 @@ name: Build Oblivion v8 Windows Installer
 # then run it from the Actions tab. It reproduces the official v8 Windows
 # job exactly, and adds an Inno Setup installer on top.
 #
-name: Build Oblivion v8 Windows Installer
+
 
 on:
   workflow_dispatch:
